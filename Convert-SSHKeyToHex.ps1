@@ -150,6 +150,22 @@ function New-SSHKeyPair {
             Remove-Item $pubKeyFile -Force -ErrorAction SilentlyContinue
             Write-ColorOutput "已删除旧密钥文件，准备生成新密钥" -ForegroundColor Green
         }
+        
+        # 确保SSH目录权限正确
+        try {
+            $acl = Get-Acl $Script:Config.SshDir
+            $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                "FullControl",
+                "ContainerInherit,ObjectInherit",
+                "InheritOnly",
+                "Allow"
+            )
+            $acl.SetAccessRule($accessRule)
+            Set-Acl $Script:Config.SshDir $acl
+        } catch {
+            Write-ColorOutput "警告: 无法设置SSH目录权限: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
     
     try {
@@ -178,19 +194,45 @@ function New-SSHKeyPair {
             return @{ PrivateKey = $privateKey; PublicKey = $pubKeyFile }
         } else {
             Write-ColorOutput "标准生成方法失败，尝试备用方案..." -ForegroundColor Yellow
-            if ($Algorithm.Name -eq "ed25519") {
-                $altArgs = "-t $($Algorithm.Name) -f `"$privateKey`" -N "" -q"
-            } else {
-                $altArgs = "-t $($Algorithm.Name) -b $($Algorithm.SelectedSize) -f `"$privateKey`" -N "" -q"
+            try {
+                if ($Algorithm.Name -eq "ed25519") {
+                    $altArgs = @("-t", $Algorithm.Name, "-f", $privateKey, "-N", '""', "-q")
+                } else {
+                    $altArgs = @("-t", $Algorithm.Name, "-b", $Algorithm.SelectedSize, "-f", $privateKey, "-N", '""', "-q")
+                }
+                
+                $process = Start-Process -FilePath "ssh-keygen" -ArgumentList $altArgs -NoNewWindow -PassThru -Wait -ErrorAction Stop
+                
+                if ($process.ExitCode -eq 0) {
+                    Write-ColorOutput "备用方法密钥生成成功" -ForegroundColor Green
+                    return @{ PrivateKey = $privateKey; PublicKey = $pubKeyFile }
+                } else {
+                    throw "密钥生成过程失败，退出代码: $($process.ExitCode)"
+                }
+            } catch {
+                throw "备用方案执行失败: $($_.Exception.Message)"
             }
-            Invoke-Expression "ssh-keygen $altArgs"
-            
-            if ($LASTEXITCODE -eq 0) {
-                Write-ColorOutput "备用方法密钥生成成功" -ForegroundColor Green
-                return @{ PrivateKey = $privateKey; PublicKey = $pubKeyFile }
-            } else {
-                throw "密钥生成过程失败，退出代码: $LASTEXITCODE"
+        
+        # 设置新生成的私钥文件权限
+        try {
+            if (Test-Path $privateKey) {
+                $acl = Get-Acl $privateKey
+                $acl.SetAccessRuleProtection($true, $false)
+                $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+                $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $userSid,
+                    "FullControl",
+                    "None",
+                    "InheritOnly",
+                    "Allow"
+                )
+                $acl.SetAccessRule($accessRule)
+                Set-Acl $privateKey $acl
+                Write-ColorOutput "私钥文件权限设置完成" -ForegroundColor Green
             }
+        } catch {
+            Write-ColorOutput "警告: 无法设置私钥文件权限: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
         }
     } catch {
         Write-ColorOutput "密钥生成失败: $($_.Exception.Message)" -ForegroundColor Red
@@ -223,7 +265,7 @@ function Convert-ToHexFormat {
         $pubContent = Get-Content $PublicKeyFile -Raw
         Write-ColorOutput "公钥文件读取成功" -ForegroundColor Green
         
-        # 解析公钥格式
+        # 解析公钥格式 - 增强错误处理和验证
         Write-ColorOutput "正在解析公钥数据结构..." -ForegroundColor Yellow
         $base64Key = $null
         $patterns = @(
@@ -239,6 +281,11 @@ function Convert-ToHexFormat {
                     break
                 }
             }
+        }
+        
+        # 验证Base64格式有效性
+        if ($base64Key -and $base64Key -match '[^A-Za-z0-9+/=]') {
+            throw "检测到无效的Base64字符，公钥文件可能已损坏"
         }
         
         if ([string]::IsNullOrWhiteSpace($base64Key)) {
@@ -265,15 +312,15 @@ function Convert-ToHexFormat {
         $hexString = [System.BitConverter]::ToString($bytes).Replace("-", "").ToUpper()
         Write-ColorOutput "16进制转换完成，字符总数: $($hexString.Length)" -ForegroundColor Green
         
-        # 格式化输出
+        # 格式化输出 - 使用StringBuilder优化性能
         Write-ColorOutput "正在进行格式化排版..." -ForegroundColor Yellow
-        $hexOutput = @()
+        $hexOutput = [System.Collections.Generic.List[string]]::new()
         for ($i = 0; $i -lt $hexString.Length; $i += 20) {
             $remaining = $hexString.Length - $i
             $chunkSize = [Math]::Min(20, $remaining)
             $line = $hexString.Substring($i, $chunkSize)
             $formattedLine = $line -replace '(.{4})', '$1 ' -replace '\s+$'
-            $hexOutput += $formattedLine
+            $hexOutput.Add($formattedLine)
         }
         
         Write-ColorOutput "格式化排版完成，共生成 $($hexOutput.Count) 行" -ForegroundColor Green
